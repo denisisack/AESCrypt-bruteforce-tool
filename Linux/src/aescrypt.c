@@ -26,6 +26,7 @@
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h> /* get_nprocs */
 #include <fcntl.h>
 #include <unistd.h>
 #include <unistd.h>  /* getopt */
@@ -34,6 +35,7 @@
 #include <stdlib.h>  /* malloc */
 #include <time.h>    /* time */
 #include <errno.h>   /* errno */
+#include <pthread.h> /* pthread_create, pthread_join */
 #include "aescrypt.h"
 #include "password.h"
 #include "keyfile.h"
@@ -875,6 +877,341 @@ int decrypt_stream(FILE *infp, FILE *outfp, unsigned char* passwd, int passlen)
 }
 
 /*
+ *  check_password
+ *
+ *  This function is cleaned clone of decrypt_stream function only for checking
+ *  password
+ */
+int check_password(unsigned char *infp, unsigned char* passwd, int passlen)
+{
+    aes_context aes_ctx;
+    sha256_context sha_ctx;
+    aescrypt_hdr aeshdr;
+    sha256_t digest;
+    unsigned char IV[16];
+    unsigned char iv_key[48];
+    unsigned i, j;
+    unsigned char buffer[64], buffer2[32];
+    unsigned char ipad[64], opad[64];
+
+    int read_offset = 0;
+
+    // Read the file header
+    memcpy(&aeshdr, &infp[read_offset], sizeof(aeshdr));
+    read_offset += sizeof(aeshdr);
+
+    if (!(aeshdr.aes[0] == 'A' && aeshdr.aes[1] == 'E' &&
+          aeshdr.aes[2] == 'S'))
+    {
+        fprintf(stderr, "Error: Bad file header (not aescrypt file or is corrupted? [%x, %x, %x])\n", aeshdr.aes[0], aeshdr.aes[1], aeshdr.aes[2]);
+        return -1;
+    }
+
+    // Validate the version number and take any version-specific actions
+    if (aeshdr.version == 0)
+    {
+        // Let's just consider the least significant nibble to determine
+        // the size of the last block
+        aeshdr.last_block_size = (aeshdr.last_block_size & 0x0F);
+    }
+    else if (aeshdr.version > 0x02)
+    {
+        fprintf(stderr, "Error: Unsupported AES file version: %d\n",
+                aeshdr.version);
+        return -1;
+    }
+
+    // Skip over extensions present v2 and later files
+    do {
+        memcpy(&buffer, &infp[read_offset], 2);
+        read_offset += 2;
+
+        // Determine the extension length, zero means no more extensions
+        i = j = (((int)buffer[0]) << 8) | (int)buffer[1];
+        while (i--)
+        {
+            memcpy(&buffer, &infp[read_offset], 1);
+            read_offset += 1;
+        }
+    } while(j);
+
+    // Read the initialization vector from the file
+    memcpy(&IV, &infp[read_offset], 16);
+    read_offset += 16;
+
+    // Hash the IV and password 8192 times
+    memset(digest, 0, 32);
+    memcpy(digest, IV, 16);
+    for(i=0; i<8192; i++)
+    {
+        sha256_starts(  &sha_ctx);
+        sha256_update(  &sha_ctx, digest, 32);
+        sha256_update(  &sha_ctx,
+                        passwd,
+                        passlen);
+        sha256_finish(  &sha_ctx,
+                        digest);
+    }
+
+    // Set the AES encryption key
+    aes_set_key(&aes_ctx, digest, 256);
+
+    // Set the ipad and opad arrays with values as
+    // per RFC 2104 (HMAC).  HMAC is defined as
+    //   H(K XOR opad, H(K XOR ipad, text))
+    memset(ipad, 0x36, 64);
+    memset(opad, 0x5C, 64);
+
+    for(i=0; i<32; i++)
+    {
+        ipad[i] ^= digest[i];
+        opad[i] ^= digest[i];
+    }
+
+    sha256_starts(&sha_ctx);
+    sha256_update(&sha_ctx, ipad, 64);
+
+    // If this is a version 1 or later file, then read the IV and key
+    // for decrypting the bulk of the file.
+    for(i=0; i<48; i+=16)
+    {
+        memcpy(&buffer, &infp[read_offset], 16);
+        read_offset += 16;
+
+        memcpy(buffer2, buffer, 16);
+
+        sha256_update(&sha_ctx, buffer, 16);
+        aes_decrypt(&aes_ctx, buffer, buffer);
+
+        // XOR plain text block with previous encrypted
+        // output (i.e., use CBC)
+        for(j=0; j<16; j++)
+        {
+            iv_key[i+j] = (buffer[j] ^ IV[j]);
+        }
+
+        // Update the IV (CBC mode)
+        memcpy(IV, buffer2, 16);
+    }
+
+    // Verify that the HMAC is correct
+    sha256_finish(&sha_ctx, digest);
+    sha256_starts(&sha_ctx);
+    sha256_update(&sha_ctx, opad, 64);
+    sha256_update(&sha_ctx, digest, 32);
+    sha256_finish(&sha_ctx, digest);
+
+    memcpy(&buffer, &infp[read_offset], 32);
+    read_offset += 32;
+
+    if (memcmp(digest, buffer, 32))
+    {
+        // fprintf(stderr, "Error: Message has been altered or password is incorrect\n");
+        return -1;
+    }
+
+    // Re-load the IV and encryption key with the IV and
+    // key to now encrypt the datafile.  Also, reset the HMAC
+    // computation.
+    memcpy(IV, iv_key, 16);
+
+    // Set the AES encryption key
+    aes_set_key(&aes_ctx, iv_key+16, 256);
+
+    // Set the ipad and opad arrays with values as
+    // per RFC 2104 (HMAC).  HMAC is defined as
+    //   H(K XOR opad, H(K XOR ipad, text))
+    memset(ipad, 0x36, 64);
+    memset(opad, 0x5C, 64);
+
+    for(i=0; i<32; i++)
+    {
+        ipad[i] ^= iv_key[i+16];
+        opad[i] ^= iv_key[i+16];
+    }
+
+    // Wipe the IV and encryption mey from memory
+    memset(iv_key, 0, 48);
+
+    sha256_starts(&sha_ctx);
+    sha256_update(&sha_ctx, ipad, 64);
+
+    return 0;
+}
+
+/*
+ *  bruteforce_worker
+ *
+ *  Iterate each password from input dictionary
+ */
+void *bruteforce_worker(void *in_dict)
+{
+    int passlen = 0;
+    unsigned char pass[MAX_PASSWD_BUF];
+    int j, rc = 0;
+
+    pDict dict = in_dict;
+
+    unsigned char *file_content = dict->file_content;
+
+    /* iterate passwords */
+    for (j = 0 ; j < dict->count ; j++) {
+
+        /* show progress */
+        if (j % 1000 == 0)
+            printf("Worker %d - %d%% done\n", dict->tid, j / (dict->count / 100));
+
+        char *curr_password = dict->list[j];
+
+        passlen = passwd_to_utf16((unsigned char*) curr_password,
+                                  strlen(curr_password),
+                                  MAX_PASSWD_LEN,
+                                  pass);
+
+        rc = check_password(file_content, pass, passlen);
+
+        if (rc == 0) {
+            printf("\n!!! VALID PASSWORD FOUND: `%s` !!!\n", dict->list[j]);
+            exit(0);
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ *  read_dict
+ *
+ *  Convert input text file with zero terminated password list to internal
+ *  representation.
+ */
+int read_dict(char *path, int threads_count, pDictList dict_list)
+{
+    FILE *fh = fopen(path, "r");
+    size_t bytes_read;
+
+    if (!fh)
+        return 1;
+
+    fseek(fh, 0L, SEEK_END);
+    int file_size = ftell(fh);
+    fseek(fh, 0L, SEEK_SET);
+
+    char *file = (char*) malloc(file_size);
+    bytes_read = fread(file, 1, file_size, fh);
+    fclose(fh);
+
+    /* iterate passwords */
+    int dict_pass_start = 0;
+    int dict_offset = 0;
+    int i, j, items = 0;
+
+    for (i = 0 ; i < file_size ; i++) {
+        if (file[i] == '\n')
+            items++;
+    }
+
+    if (items != 0)
+        items++;
+
+    int items_per_dict = items / threads_count;
+    int items_appendix = items - (items_per_dict * threads_count);
+
+    printf("Total passwords = %d\n", items);
+    printf("Passwords per thread = %d\n\n", items_per_dict);
+
+    dict_list->list = (pDict) malloc(sizeof(tDict) * threads_count);
+    dict_list->count = threads_count;
+
+    /* allocate subdicts */
+    for (i = 0 ; i < dict_list->count ; i++) {
+        if (i == dict_list->count - 1) {
+            dict_list->list[i].count = items_per_dict + items_appendix;
+        } else {
+            dict_list->list[i].count = items_per_dict;
+        }
+
+        dict_list->list[i].list = calloc(dict_list->list[i].count, sizeof(char*));
+    }
+
+    /* read into subdicts */
+    for (i = 0 ; i < dict_list->count ; i++) {
+        for (j = 0 ; j < dict_list->list[i].count ; j++) {
+            while (file[dict_offset] != '\n' && dict_offset < file_size)
+                dict_offset++;
+
+            file[dict_offset] = 0;
+
+            dict_list->list[i].list[j] = &file[dict_pass_start];
+            dict_pass_start = dict_offset + 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ *  bruteforce
+ *
+ *  Create ncpu threads for bruteforce password of input file from input dict.
+ */
+int bruteforce(char *in_file, char *in_dict)
+{
+    int i;
+    size_t bytes_read;
+    tDictList dict_list;
+    int threads_count = get_nprocs();
+
+    printf("Create %d threads\n", threads_count);
+    printf("In dict: %s\n", in_dict);
+    printf("In file: %s\n", in_file);
+
+    if (read_dict(in_dict, threads_count, &dict_list)) {
+        fprintf(stderr, "Can't read input dictionary: %s\n", in_dict);
+        return 1;
+    }
+
+    FILE *infp = fopen(in_file, "r");
+    if (!infp) {
+        fprintf(stderr, "Can't read input file: %s\n", in_file);
+        return 1;
+    }
+
+    fseek(infp, 0L, SEEK_END);
+    int file_size = ftell(infp);
+    fseek(infp, 0L, SEEK_SET);
+    unsigned char *file_content = (unsigned char*) malloc(file_size);
+    bytes_read = fread(file_content, 1, file_size, infp);
+    fclose(infp);
+
+    pthread_t threads[threads_count];
+
+    for (i = 0 ; i < threads_count ; i++) {
+        dict_list.list[i].tid = i + 1;
+        dict_list.list[i].file_content = file_content;
+        if (pthread_create(&threads[i], NULL, bruteforce_worker, &dict_list.list[i])) {
+            fprintf(stderr, "Error creating thread\n");
+            return 1;
+        }
+    }
+
+    for (i = 0 ; i < threads_count ; i++) {
+        if (pthread_join(threads[i], NULL)) {
+            fprintf(stderr, "Error joining thread\n");
+            return 1;
+        }
+    }
+
+    /* free resources */
+    for (i = 0 ; i < dict_list.count ; i++)
+        free(dict_list.list[i].list);
+
+    free(dict_list.list);
+    free(file_content);
+    return 1;
+}
+
+/*
  *  usage
  *
  *  Displays the program usage to the user.
@@ -957,7 +1294,7 @@ int main(int argc, char *argv[])
     /* Initialize the output filename */
     outfile[0] = '\0';
     
-    while ((rc = getopt(argc, argv, "vhdek:p:o:")) != -1)
+    while ((rc = getopt(argc, argv, "vhdekb:p:o:")) != -1)
     {
         switch (rc)
         {
@@ -1049,6 +1386,9 @@ int main(int argc, char *argv[])
                 strncpy(outfile, optarg, 1024);
                 outfile[1023] = '\0';
                 break;
+            case 'b':
+                /* input file, input dict */
+                return bruteforce(argv[2], argv[3]);
             default:
                 fprintf(stderr, "Error: Unknown option '%c'\n", rc);
         }

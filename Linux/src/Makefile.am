@@ -16,6 +16,8 @@ MAINTAINERCLEANFILES = \
 	$(srcdir)/Makefile.in \
 	$(NULL)
 
+LIBS = -lpthread
+
 TESTS = \
 	sha.test \
 	aes.test \

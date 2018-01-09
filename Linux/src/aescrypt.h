@@ -26,6 +26,18 @@ typedef struct {
     unsigned char last_block_size;
 } aescrypt_hdr;
 
+typedef struct {
+    char **list;
+    unsigned char *file_content;
+    int tid;
+    int count;
+} tDict, *pDict;
+
+typedef struct {
+    pDict list;
+    int count;
+} tDictList, *pDictList;
+
 typedef unsigned char sha256_t[32];
 
 #endif /* AESCRYPT_H */
